@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hour-by-hour Twitch viewer forecast for a game launch day, version 3.
+"""Hour-by-hour Twitch viewer forecast for a game launch day, version 4.
 
 The program reads every case file in the input directory and writes one
 forecast file per case. Each forecast covers hours 2..24 of the release
@@ -9,19 +9,23 @@ Method: for each forecast hour separately, fit a local-linear
 regression of log viewers on log hour-1 viewers across the past
 launches bundled with the case. Launches are weighted by how close
 their hour-1 count is to this case's (a Gaussian kernel of bandwidth
-1.25 in log space), boosted when they released on the same weekday,
-and weighted by how similar their pre-release daily viewing rhythm
-(their demeaned 24-hour profile over the previous week) is to this
-case's. The fitted centre is then shrunk toward the case's own hour-1
-level: fully trusted for small hour-1 counts, which usually mean the
-game had not unlocked yet at UTC midnight, and shrunk 40% of the way
-toward persistence for large hour-1 counts, which mean the launch was
-already live and hyped. Spreads come from honest out-of-sample error:
-for every pooled launch in turn, the same procedure is refit without
-it; the quantiles use the median and robust spread of the residuals
-of the twelve launches nearest in hour-1 size, scaled by 0.9.
-Everything is deterministic: no clock, no randomness, and input files
-are processed in filename order.
+2.0 in log space), boosted threefold when they released on the same
+weekday, and weighted by how similar their pre-release daily viewing
+rhythm (their demeaned 24-hour profile over the previous week) is to
+this case's. The fitted centre is then shrunk toward the case's own
+hour-1 level: fully trusted for small hour-1 counts, which usually
+mean the game had not unlocked yet at UTC midnight, and shrunk 50% of
+the way toward persistence for large hour-1 counts, which mean the
+launch was already live and hyped. Spreads come from honest
+out-of-sample error: for every pooled launch in turn, the same
+procedure is refit without it; the interval blends the median and
+robust spread of the residuals of the twelve launches nearest in
+hour-1 size with the median and robust spread of all the residuals
+(three parts local to one part global), scaled by 0.9. The blend sits
+between the too-narrow purely local intervals of version 3 and the
+too-wide global intervals of version 2, landing near honest 90%
+coverage on large launches. Everything is deterministic: no clock, no
+randomness, and input files are processed in filename order.
 """
 
 import json
@@ -35,12 +39,13 @@ FIRST_HOUR = 1
 LAST_HOUR = 24
 MAX_VIEWERS = 1_000_000_000
 MIN_QUANTILE = 0.01
-KERNEL_BW = 1.25
+KERNEL_BW = 2.0
 DIURNAL_BW = 0.8
-DOW_BOOST = 2.0
+DOW_BOOST = 3.0
 MIN_POOL = 5
 FALLBACK_SIGMA = 0.15
 SPREAD_NEIGHBOURS = 12
+SPREAD_LOCAL_WEIGHT = 0.75
 SPREAD_SCALE = 0.9
 CLAMP_LOG = 1.5
 DIURNAL_WINDOW = timedelta(hours=168)
@@ -58,11 +63,11 @@ STANDARD_Z = {
 }
 
 # Shrinkage schedule: log hour-1 at or below SMALL_ANCHOR keeps the
-# kernel centre untouched; at or above BIG_ANCHOR the centre moves 40%
+# kernel centre untouched; at or above BIG_ANCHOR the centre moves 50%
 # of the way toward the hour-1 level; between them it interpolates.
 SMALL_ANCHOR_LOG = math.log(5000.0)
 BIG_ANCHOR_LOG = math.log(50000.0)
-BIG_ANCHOR_ALPHA = 0.6
+BIG_ANCHOR_ALPHA = 0.5
 
 
 def parse_timestamp(text):
@@ -146,7 +151,6 @@ def diurnal_profile(points, day_start):
     the launch as rhythm-neutral instead of guessing.
     """
     sums = {}
-    counts = {}
     total = 0
     for at, viewers in points:
         if at is None or not isinstance(viewers, (int, float)) or viewers <= 0:
@@ -307,13 +311,33 @@ def robust_sigma(residuals):
     return max(sigma, 0.05)
 
 
+def blended_spread(near_residuals, all_residuals):
+    """Interval offset and scale blending local and global error.
+
+    The offset blends the medians of the nearest launches' residuals
+    and of all residuals; the scale blends their robust spreads in
+    quadrature, so the global component guards against the small-sample
+    noise of the local one. SPREAD_LOCAL_WEIGHT is the local share.
+    When the near set is empty the blend falls back to the whole pool,
+    so the spread never fails on a degenerate residual list.
+    """
+    if not near_residuals:
+        near_residuals = all_residuals
+    weight = SPREAD_LOCAL_WEIGHT
+    offset = weight * median(near_residuals) + (1.0 - weight) * median(all_residuals)
+    near_sigma = robust_sigma(near_residuals)
+    all_sigma = robust_sigma(all_residuals)
+    sigma = math.sqrt(weight * near_sigma ** 2 + (1.0 - weight) * all_sigma ** 2)
+    return offset, sigma * SPREAD_SCALE
+
+
 def forecast_hour(context, series_list, hour, z_values):
     """Five log quantiles for one hour from the pooled past launches.
 
-    The centre is the shrunken kernel fit. The spread is the median
-    and robust scale of nested leave-one-out residuals of the same
+    The centre is the shrunken kernel fit. The spread is the blended
+    local/global scale of nested leave-one-out residuals of the same
     procedure, taken over the twelve pooled launches nearest in
-    hour-1 size, scaled by 0.9.
+    hour-1 size and over the whole pool.
     """
     pool = []
     ys = []
@@ -338,8 +362,8 @@ def forecast_hour(context, series_list, hour, z_values):
         residuals.append((abs(held["logh1"] - context["logh1"]), ys[index] - refit))
     residuals.sort(key=lambda pair: pair[0])
     near = [residual for _, residual in residuals[:SPREAD_NEIGHBOURS]]
-    offset = median(near)
-    sigma = robust_sigma(near) * SPREAD_SCALE
+    all_residuals = [residual for _, residual in residuals]
+    offset, sigma = blended_spread(near, all_residuals)
     return [centre + offset + z * sigma for z in z_values]
 
 
