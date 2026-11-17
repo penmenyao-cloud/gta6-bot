@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hour-by-hour Twitch viewer forecast for a game launch day, version 2.
+"""Hour-by-hour Twitch viewer forecast for a game launch day, version 3.
 
 The program reads every case file in the input directory and writes one
 forecast file per case. Each forecast covers hours 2..24 of the release
@@ -7,33 +7,45 @@ day at five quantiles.
 
 Method: for each forecast hour separately, fit a local-linear
 regression of log viewers on log hour-1 viewers across the past
-launches bundled with the case, weighting launches by how close their
-hour-1 count is to this case's (a Gaussian kernel of bandwidth 1 in log
-space). The fitted centre is then shrunk toward the case's own hour-1
+launches bundled with the case. Launches are weighted by how close
+their hour-1 count is to this case's (a Gaussian kernel of bandwidth
+1.25 in log space), boosted when they released on the same weekday,
+and weighted by how similar their pre-release daily viewing rhythm
+(their demeaned 24-hour profile over the previous week) is to this
+case's. The fitted centre is then shrunk toward the case's own hour-1
 level: fully trusted for small hour-1 counts, which usually mean the
-game had not unlocked yet at UTC midnight, and shrunk 30% of the way
+game had not unlocked yet at UTC midnight, and shrunk 40% of the way
 toward persistence for large hour-1 counts, which mean the launch was
 already live and hyped. Spreads come from honest out-of-sample error:
 for every pooled launch in turn, the same procedure is refit without
-it, and the quantiles are the median and robust spread of those
-leave-one-out residuals. Everything is deterministic: no clock, no
-randomness, and input files are processed in filename order.
+it; the quantiles use the median and robust spread of the residuals
+of the twelve launches nearest in hour-1 size, scaled by 0.9.
+Everything is deterministic: no clock, no randomness, and input files
+are processed in filename order.
 """
 
 import json
 import math
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 DEFAULT_LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 FIRST_HOUR = 1
 LAST_HOUR = 24
 MAX_VIEWERS = 1_000_000_000
 MIN_QUANTILE = 0.01
-KERNEL_BW = 1.0
+KERNEL_BW = 1.25
+DIURNAL_BW = 0.8
+DOW_BOOST = 2.0
 MIN_POOL = 5
 FALLBACK_SIGMA = 0.15
+SPREAD_NEIGHBOURS = 12
+SPREAD_SCALE = 0.9
+CLAMP_LOG = 1.5
+DIURNAL_WINDOW = timedelta(hours=168)
+DIURNAL_MIN_HOURS = 20
+DIURNAL_MIN_POINTS = 48
 
 # Exact normal quantiles for the standard levels; other levels use the
 # rational approximation in norm_ppf.
@@ -46,21 +58,28 @@ STANDARD_Z = {
 }
 
 # Shrinkage schedule: log hour-1 at or below SMALL_ANCHOR keeps the
-# kernel centre untouched; at or above BIG_ANCHOR the centre moves 30%
+# kernel centre untouched; at or above BIG_ANCHOR the centre moves 40%
 # of the way toward the hour-1 level; between them it interpolates.
 SMALL_ANCHOR_LOG = math.log(5000.0)
 BIG_ANCHOR_LOG = math.log(50000.0)
-BIG_ANCHOR_ALPHA = 0.7
+BIG_ANCHOR_ALPHA = 0.6
 
 
 def parse_timestamp(text):
-    """Parse an ISO-8601 timestamp, returning None when unusable."""
+    """Parse an ISO-8601 timestamp, returning None when unusable.
+
+    A timestamp with no timezone is read as UTC, so mixing naive and
+    aware stamps in one file can never break the hour arithmetic.
+    """
     if not isinstance(text, str):
         return None
     try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def median(values):
@@ -115,8 +134,47 @@ def shrink_alpha(log_anchor):
     return 1.0 + frac * (BIG_ANCHOR_ALPHA - 1.0)
 
 
+def diurnal_profile(points, day_start):
+    """Demeaned 24-hour viewing profile from pre-release points.
+
+    points is an iterable of (timestamp, viewers) pairs. Only points
+    from the seven days before the release day count. The profile is
+    the mean log viewers at each UTC hour, minus its own mean, so it
+    captures the shape of the daily rhythm rather than the level.
+    Returns None when coverage is too thin to trust (fewer than 20
+    distinct UTC hours or fewer than 48 points): callers then treat
+    the launch as rhythm-neutral instead of guessing.
+    """
+    sums = {}
+    counts = {}
+    total = 0
+    for at, viewers in points:
+        if at is None or not isinstance(viewers, (int, float)) or viewers <= 0:
+            continue
+        offset = at - day_start
+        if -DIURNAL_WINDOW <= offset < timedelta(0):
+            slot = sums.setdefault(at.hour, [0.0, 0])
+            slot[0] += math.log(float(viewers))
+            slot[1] += 1
+            total += 1
+    if len(sums) < DIURNAL_MIN_HOURS or total < DIURNAL_MIN_POINTS:
+        return None
+    filled = []
+    for hour in range(24):
+        if hour in sums:
+            filled.append(sums[hour][0] / sums[hour][1])
+        else:
+            filled.append(None)
+    known = [value for value in filled if value is not None]
+    overall = sum(known) / len(known)
+    filled = [value if value is not None else overall for value in filled]
+    mean_profile = sum(filled) / 24.0
+    return [value - mean_profile for value in filled]
+
+
 def series_from_comparable(comparable):
-    """Log viewer counts by release-day hour for one past launch.
+    """Log viewer counts by release-day hour for one past launch,
+    plus its weekday and pre-release daily rhythm.
 
     Returns None when the launch has no positive hour-1 count, so a
     history that never covers a release day (such as the target game's
@@ -128,44 +186,109 @@ def series_from_comparable(comparable):
     if start is None:
         return None
     hours = {}
+    points = []
     for point in comparable.get("hourly") or []:
         if not isinstance(point, dict):
             continue
         at = parse_timestamp(point.get("from"))
         if at is None:
             continue
+        viewers = point.get("viewers")
+        if not isinstance(viewers, (int, float)) or viewers <= 0:
+            continue
+        points.append((at, float(viewers)))
         hour = int((at - start).total_seconds() // 3600) + 1
         if FIRST_HOUR <= hour <= LAST_HOUR and hour not in hours:
-            viewers = point.get("viewers")
-            if isinstance(viewers, (int, float)) and viewers > 0:
-                hours[hour] = math.log(float(viewers))
+            hours[hour] = math.log(float(viewers))
     if FIRST_HOUR not in hours:
         return None
-    return hours
+    return {
+        "hours": hours,
+        "logh1": hours[FIRST_HOUR],
+        "dow": start.weekday(),
+        "diurnal": diurnal_profile(points, start),
+    }
 
 
-def kernel_centre(x0, xs, ys):
-    """Local-linear kernel fit of y on x, evaluated at x0.
+def target_context(case, log_anchor):
+    """Weekday and pre-release rhythm of the case being forecast."""
+    start = parse_timestamp(case.get("day_start"))
+    points = []
+    for point in case.get("history_hourly") or []:
+        if not isinstance(point, dict):
+            continue
+        at = parse_timestamp(point.get("from"))
+        viewers = point.get("viewers")
+        if at is not None and isinstance(viewers, (int, float)) and viewers > 0:
+            points.append((at, float(viewers)))
+    profile = diurnal_profile(points, start) if start is not None else None
+    return {
+        "logh1": log_anchor,
+        "dow": start.weekday() if start is not None else None,
+        "diurnal": profile,
+    }
 
-    A Gaussian kernel of bandwidth KERNEL_BW weights nearby launches;
-    when the total weight is tiny (an anchor far from every launch),
-    the fit falls back to an unweighted regression over the pool. The
-    fitted value is clamped to the pool's observed range expanded by
-    1.5 log units on each side, so an anchor beyond every pooled
-    launch (a record-breaking hour 1) can extrapolate only modestly
-    instead of running away on a noisy local slope.
+
+def fit_weights(pool, context):
+    """Similarity weights of pooled launches for a target context.
+
+    A Gaussian kernel on log hour-1, boosted for launches released on
+    the same weekday, and weighted by pre-release rhythm similarity
+    when both rhythms are known. When the combined weight is tiny (a
+    target far from every launch), the fit falls back to the weekday
+    weights alone, and then to uniform weights, instead of trusting a
+    handful of distant points.
     """
-    weights = [math.exp(-0.5 * ((x - x0) / KERNEL_BW) ** 2) for x in xs]
+    weights = []
+    for series in pool:
+        weight = math.exp(-0.5 * ((series["logh1"] - context["logh1"]) / KERNEL_BW) ** 2)
+        if context["dow"] is not None and series["dow"] == context["dow"]:
+            weight *= DOW_BOOST
+        weights.append(weight)
     if sum(weights) < 3.0:
-        weights = [1.0] * len(xs)
+        weights = [
+            DOW_BOOST if (context["dow"] is not None and series["dow"] == context["dow"]) else 1.0
+            for series in pool
+        ]
+        total = sum(weights)
+        weights = [weight / total * len(weights) for weight in weights]
+    if context["diurnal"] is not None:
+        for index, series in enumerate(pool):
+            profile = series["diurnal"]
+            if profile is None:
+                continue
+            dist = math.sqrt(
+                sum((a - b) ** 2 for a, b in zip(context["diurnal"], profile)) / 24.0
+            )
+            weights[index] *= math.exp(-0.5 * (dist / DIURNAL_BW) ** 2)
+        if sum(weights) < 3.0:
+            weights = [1.0] * len(pool)
+    return weights
+
+
+def kernel_centre(context, pool, ys):
+    """Local-linear kernel fit of log viewers on log hour-1, evaluated
+    at the target context and shrunk toward the target's hour-1 level.
+
+    pool holds the pooled launches' series dicts and ys their log
+    viewer counts at the forecast hour, in the same order. The fitted
+    value is clamped to the pool's observed range expanded by 1.5 log
+    units on each side, so an anchor beyond every pooled launch (a
+    record-breaking hour 1) can extrapolate only modestly instead of
+    running away on a noisy local slope.
+    """
+    weights = fit_weights(pool, context)
+    xs = [series["logh1"] for series in pool]
     total = sum(weights)
     xbar = sum(w * x for w, x in zip(weights, xs)) / total
     ybar = sum(w * y for w, y in zip(weights, ys)) / total
     sxx = sum(w * (x - xbar) ** 2 for w, x in zip(weights, xs))
     sxy = sum(w * (x - xbar) * (y - ybar) for w, x, y in zip(weights, xs, ys))
     slope = sxy / sxx if sxx > 0.0 else 0.0
-    fitted = ybar + slope * (x0 - xbar)
-    return min(max(fitted, min(ys) - 1.5), max(ys) + 1.5)
+    fitted = ybar + slope * (context["logh1"] - xbar)
+    fitted = min(max(fitted, min(ys) - CLAMP_LOG), max(ys) + CLAMP_LOG)
+    alpha = shrink_alpha(context["logh1"])
+    return alpha * fitted + (1.0 - alpha) * context["logh1"]
 
 
 def robust_sigma(residuals):
@@ -184,31 +307,39 @@ def robust_sigma(residuals):
     return max(sigma, 0.05)
 
 
-def forecast_hour(log_anchor, pool, hour, z_values):
-    """Five log quantiles for one hour from a pool of past launches.
+def forecast_hour(context, series_list, hour, z_values):
+    """Five log quantiles for one hour from the pooled past launches.
 
-    pool holds (log hour-1, log viewers at this hour) pairs. The centre
-    is the shrunken kernel fit; the spread is the median and robust
-    scale of nested leave-one-out residuals of the same procedure.
+    The centre is the shrunken kernel fit. The spread is the median
+    and robust scale of nested leave-one-out residuals of the same
+    procedure, taken over the twelve pooled launches nearest in
+    hour-1 size, scaled by 0.9.
     """
+    pool = []
+    ys = []
+    for series in series_list:
+        if hour in series["hours"]:
+            pool.append(series)
+            ys.append(series["hours"][hour])
     if len(pool) < MIN_POOL:
         sigma = FALLBACK_SIGMA * math.sqrt(hour - FIRST_HOUR)
-        return [log_anchor + z * sigma for z in z_values]
-    xs = [pair[0] for pair in pool]
-    ys = [pair[1] for pair in pool]
-    alpha = shrink_alpha(log_anchor)
-    centre = kernel_centre(log_anchor, xs, ys)
-    centre = alpha * centre + (1.0 - alpha) * log_anchor
+        return [context["logh1"] + z * sigma for z in z_values]
+    centre = kernel_centre(context, pool, ys)
     residuals = []
-    for index in range(len(pool)):
-        sub_xs = xs[:index] + xs[index + 1:]
+    for index, held in enumerate(pool):
+        sub_pool = pool[:index] + pool[index + 1:]
         sub_ys = ys[:index] + ys[index + 1:]
-        held_alpha = shrink_alpha(xs[index])
-        refit = kernel_centre(xs[index], sub_xs, sub_ys)
-        refit = held_alpha * refit + (1.0 - held_alpha) * xs[index]
-        residuals.append(ys[index] - refit)
-    offset = median(residuals)
-    sigma = robust_sigma(residuals)
+        held_context = {
+            "logh1": held["logh1"],
+            "dow": held["dow"],
+            "diurnal": held["diurnal"],
+        }
+        refit = kernel_centre(held_context, sub_pool, sub_ys)
+        residuals.append((abs(held["logh1"] - context["logh1"]), ys[index] - refit))
+    residuals.sort(key=lambda pair: pair[0])
+    near = [residual for _, residual in residuals[:SPREAD_NEIGHBOURS]]
+    offset = median(near)
+    sigma = robust_sigma(near) * SPREAD_SCALE
     return [centre + offset + z * sigma for z in z_values]
 
 
@@ -264,19 +395,15 @@ def forecast_case(case):
     log_anchor = math.log(anchor)
     levels = forecast_levels(case)
     z_values = [norm_ppf(tau) for tau in levels]
-    series = []
+    context = target_context(case, log_anchor)
+    series_list = []
     for comparable in case.get("comparables") or []:
-        hours = series_from_comparable(comparable)
-        if hours is not None:
-            series.append(hours)
+        series = series_from_comparable(comparable)
+        if series is not None:
+            series_list.append(series)
     rows = []
     for hour in range(FIRST_HOUR + 1, LAST_HOUR + 1):
-        pool = [
-            (hours[FIRST_HOUR], hours[hour])
-            for hours in series
-            if hour in hours
-        ]
-        log_quantiles = forecast_hour(log_anchor, pool, hour, z_values)
+        log_quantiles = forecast_hour(context, series_list, hour, z_values)
         rows.append({"hour": hour, "q": clean_quantiles(log_quantiles)})
     return {"hours": rows}
 
